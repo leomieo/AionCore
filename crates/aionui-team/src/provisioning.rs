@@ -130,6 +130,11 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         ))
     }
 
+    /// Explicit persisted ACP identity, absent for builtin conversations.
+    async fn conversation_agent_id(&self, _user_id: &str, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+
     async fn supports_context_reset(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, TeamError> {
         Ok(false)
     }
@@ -606,7 +611,8 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<(TeamToolTransport, aionui_common::ResolvedBackendCapabilities), TeamError> {
-        let capabilities = self.capability_port.resolve(user_id, &agent.backend, None).await?;
+        let agent_id = self.conversation_port.conversation_agent_id(user_id, &agent.conversation_id).await?;
+        let capabilities = self.capability_port.resolve(user_id, &agent.backend, agent_id.as_deref()).await?;
         if capabilities.mcp.stdio {
             return Ok((TeamToolTransport::Mcp, capabilities));
         }

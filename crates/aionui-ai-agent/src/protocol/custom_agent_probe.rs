@@ -58,10 +58,9 @@ pub async fn try_connect_custom_agent(
 /// As [`try_connect_custom_agent`], plus the catalog the probe's `session/new`
 /// advertised. The probe already pays for a full spawn + `initialize` +
 /// `session/new`; callers that persist agent metadata use this variant so that
-/// data is stored instead of thrown away. The partial is `Some` only on a
-/// successful session whose agent advertised at least one of modes / models /
-/// config options — an auth-gated or failing probe yields `None`, never an
-/// empty write that would blank an existing catalog.
+/// data is stored instead of thrown away. Initialize capabilities survive an
+/// auth-gated session; session catalog fields are added only after session/new
+/// succeeds. Failed initialization yields no handshake.
 pub async fn try_connect_custom_agent_with_catalog(
     command: &str,
     args: &[String],
@@ -90,13 +89,7 @@ pub async fn try_connect_custom_agent_with_catalog(
     };
 
     let outcome = match tokio::time::timeout(STEP2_TIMEOUT, run_handshake(&proc)).await {
-        Ok(outcome) => {
-            let catalog = match &outcome {
-                ProbeOutcome::Ok(catalog) => catalog.clone(),
-                _ => None,
-            };
-            (outcome.into_response(), catalog)
-        }
+        Ok(outcome) => outcome.into_result(),
         Err(_) => (
             TryConnectCustomAgentResponse::FailAcp {
                 error: format!("ACP handshake did not complete within {}s", STEP2_TIMEOUT.as_secs()),
@@ -117,7 +110,47 @@ pub async fn try_connect_custom_agent_with_catalog(
 }
 
 fn first_token(command: &str) -> &str {
-    command.split_whitespace().next().unwrap_or(command)
+    // Custom-agent command is an executable path; arguments have their own array.
+    if std::path::Path::new(command).is_file() {
+        command
+    } else {
+        command.split_whitespace().next().unwrap_or(command)
+    }
+}
+
+#[cfg(test)]
+mod command_path_tests {
+    use super::first_token;
+
+    #[test]
+    fn initialized_capabilities_survive_auth_required_session() {
+        use super::ProbeOutcome;
+        use aionui_api_types::{AgentHandshake, TryConnectCustomAgentResponse};
+        let capabilities = serde_json::json!({"mcpCapabilities": {"stdio": true}});
+        let handshake = AgentHandshake {
+            agent_capabilities: Some(capabilities.clone()),
+            ..Default::default()
+        };
+        let (response, partial) = ProbeOutcome::Auth("login required".into(), Box::new(handshake)).into_result();
+        assert!(matches!(response, TryConnectCustomAgentResponse::FailAuth { .. }));
+        assert_eq!(partial.unwrap().agent_capabilities, Some(capabilities));
+    }
+
+    #[test]
+    fn preserves_existing_executable_path_with_spaces() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("acp probe path {unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("python executable.exe");
+        std::fs::write(&executable, b"test executable marker").unwrap();
+        let command = executable.to_str().unwrap();
+        assert_eq!(first_token(command), command);
+        assert_eq!(first_token("python --legacy-option"), "python");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 async fn spawn_probe_process(
@@ -168,15 +201,24 @@ enum ProbeOutcome {
     /// session path persists. `None` when the agent advertised nothing. Boxed to
     /// keep the enum small: the success payload dwarfs the error strings.
     Ok(Option<Box<AgentHandshake>>),
-    Auth(String),
+    Auth(String, Box<AgentHandshake>),
     Fail(String),
 }
 
 impl ProbeOutcome {
+    fn into_result(self) -> (TryConnectCustomAgentResponse, Option<Box<AgentHandshake>>) {
+        let handshake = match &self {
+            Self::Ok(handshake) => handshake.clone(),
+            Self::Auth(_, handshake) => Some(handshake.clone()),
+            Self::Fail(_) => None,
+        };
+        (self.into_response(), handshake)
+    }
+
     fn into_response(self) -> TryConnectCustomAgentResponse {
         match self {
             ProbeOutcome::Ok(_) => TryConnectCustomAgentResponse::Success,
-            ProbeOutcome::Auth(error) => TryConnectCustomAgentResponse::FailAuth { error },
+            ProbeOutcome::Auth(error, _) => TryConnectCustomAgentResponse::FailAuth { error },
             ProbeOutcome::Fail(error) => TryConnectCustomAgentResponse::FailAcp { error },
         }
     }
@@ -245,6 +287,12 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     // config options, which the caller persists into `agent_metadata` so the
     // picker is populated before the user ever opens a conversation. Discarding
     // it meant a probed-online agent still showed an empty picker.
+    let mut handshake = AgentHandshake {
+        agent_capabilities: protocol
+            .agent_capabilities()
+            .map(|capabilities| serde_json::to_value(capabilities).expect("ACP capabilities serialize to JSON")),
+        ..Default::default()
+    };
     let outcome = match protocol.new_session(NewSessionRequest::new(std::env::temp_dir())).await {
         Ok((response, legacy_models)) => {
             // Same extraction the live session path performs (`agent_session_flow`):
@@ -252,18 +300,21 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
             let models = legacy_models
                 .as_ref()
                 .and_then(crate::manager::acp::legacy_session_model::LegacySessionModelState::from_state_value);
-            ProbeOutcome::Ok(
-                crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
-                    response.modes.as_ref(),
-                    models.as_ref(),
-                    response.config_options.as_deref(),
-                )
-                .map(Box::new),
-            )
+            if let Some(catalog) = crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
+                response.modes.as_ref(),
+                models.as_ref(),
+                response.config_options.as_deref(),
+            ) {
+                handshake.available_modes = catalog.available_modes;
+                handshake.available_models = catalog.available_models;
+                handshake.config_options = catalog.config_options;
+            }
+            ProbeOutcome::Ok(Some(Box::new(handshake)))
         }
-        Err(AcpError::AuthRequired) => {
-            ProbeOutcome::Auth("Agent reachable but requires login/authorization".to_string())
-        }
+        Err(AcpError::AuthRequired) => ProbeOutcome::Auth(
+            "Agent reachable but requires login/authorization".to_string(),
+            Box::new(handshake),
+        ),
         Err(e) => ProbeOutcome::Fail(format!("ACP session/new failed: {e}")),
     };
 

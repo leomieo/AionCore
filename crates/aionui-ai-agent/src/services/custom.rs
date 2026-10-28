@@ -51,11 +51,17 @@ impl AgentService {
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
-        probe_or_reject(&req).await?;
+        let capabilities = probe_or_reject(&req).await?;
 
         let id = generate_short_id();
-        self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
-            .await
+        self.upsert_custom_row(
+            user_id,
+            &id,
+            &req,
+            /* keep_enabled = */ true,
+            capabilities.as_deref(),
+        )
+        .await
     }
 
     pub async fn update_custom_agent(
@@ -77,10 +83,11 @@ impl AgentService {
                 "Only custom agents can be edited via this endpoint",
             ));
         }
-        probe_or_reject(&req).await?;
+        let capabilities = probe_or_reject(&req).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(user_id, id, &req, keep_enabled).await
+        self.upsert_custom_row(user_id, id, &req, keep_enabled, capabilities.as_deref())
+            .await
     }
 
     pub async fn delete_custom_agent(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
@@ -144,6 +151,7 @@ impl AgentService {
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
+        capabilities: Option<&str>,
     ) -> Result<AgentMetadata, AgentError> {
         let advanced = req.advanced.clone().unwrap_or_default();
 
@@ -187,7 +195,7 @@ impl AgentService {
             skill_delivery: None,
             behavior_policy: behavior_policy_json.as_deref(),
             yolo_id: advanced.yolo_id.as_deref(),
-            agent_capabilities: None,
+            agent_capabilities: capabilities,
             auth_methods: None,
             config_options: None,
             available_modes: None,
@@ -226,7 +234,7 @@ fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     Ok(())
 }
 
-async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
+async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<Option<String>, AgentError> {
     // Test-only bypass — real probe spawns a child process and relies
     // on a working ACP CLI on PATH, which is not present in CI.
     // Gated behind cfg(test) / the `test-support` feature so production
@@ -234,18 +242,28 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentErro
     #[cfg(any(test, feature = "test-support"))]
     if std::env::var("AIONUI_BYPASS_PROBE").is_ok() {
         tracing::warn!("AIONUI_BYPASS_PROBE set — skipping custom agent probe. Test-only.");
-        return Ok(());
+        return Ok(None);
     }
 
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-    match probe(&req.command, &req.args, &env_map, None).await {
-        TryConnectCustomAgentResponse::Success => Ok(()),
+    let (response, handshake) = crate::protocol::custom_agent_probe::try_connect_custom_agent_with_catalog(
+        &req.command,
+        &req.args,
+        &env_map,
+        None,
+    )
+    .await;
+    let capabilities = handshake
+        .and_then(|h| h.agent_capabilities)
+        .map(|value| value.to_string());
+    match response {
+        TryConnectCustomAgentResponse::Success => Ok(capabilities.clone()),
         // Reachable but not authorized is a valid agent the user simply hasn't
         // logged into yet — accept the save so it lands in the list (offline,
         // needs-login), where a later "test connection" confirms recovery.
         TryConnectCustomAgentResponse::FailAuth { error } => {
             tracing::info!(%error, "custom agent reachable but requires auth; accepting save");
-            Ok(())
+            Ok(capabilities)
         }
         TryConnectCustomAgentResponse::FailCli { error } => {
             Err(AgentError::bad_request(format!("cli_not_found: {error}")))
@@ -257,5 +275,31 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentErro
 }
 
 fn first_token(s: &str) -> &str {
-    s.split_whitespace().next().unwrap_or(s)
+    // Match registration probing: never tokenize an existing executable path.
+    if std::path::Path::new(s).is_file() {
+        s
+    } else {
+        s.split_whitespace().next().unwrap_or(s)
+    }
+}
+
+#[cfg(test)]
+mod command_path_tests {
+    use super::first_token;
+
+    #[test]
+    fn preserves_existing_executable_path_with_spaces() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("acp runtime path {unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("python executable.exe");
+        std::fs::write(&executable, b"test executable marker").unwrap();
+        let command = executable.to_str().unwrap();
+        assert_eq!(first_token(command), command);
+        assert_eq!(first_token("python --legacy-option"), "python");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

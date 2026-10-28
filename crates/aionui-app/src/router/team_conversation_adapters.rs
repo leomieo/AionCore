@@ -598,6 +598,14 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn conversation_agent_id(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
+            return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra.get("agent_id").and_then(serde_json::Value::as_str).map(str::to_owned))
+    }
+
     async fn conversation_model_facts(&self, conversation_id: &str) -> Result<TeamConversationModelFacts, TeamError> {
         let user_id = self.require_owner_user_id(conversation_id).await?;
         let row = self

@@ -86,6 +86,7 @@ impl TeamToolCapabilityPort for TeamCapabilityResolver {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .or_else(|| resolve_agent_binding_from_rows(&rows, backend).map(|binding| binding.agent_id));
+        tracing::debug!(backend, agent_id, ?selected_id, "resolved team capability identity");
         let Some(row) = selected_id.and_then(|id| rows.into_iter().find(|row| row.id == id)) else {
             return Ok(ResolvedBackendCapabilities {
                 cli_fallback: true,
@@ -178,6 +179,20 @@ mod tests {
                 .iter()
                 .all(|caps| caps.origin == CapabilityOrigin::DirectDescriptor)
         );
+    }
+
+    #[tokio::test]
+    async fn custom_agent_capabilities_use_explicit_identity_not_generic_acp_backend() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query("UPDATE agent_metadata SET agent_id = 'custom-team-agent', agent_source = 'custom', is_builtin = 0, backend = 'acp', agent_capabilities = ? WHERE agent_id = 'a9f3c21e'")
+            .bind(r#"{"mcpCapabilities":{"http":true,"sse":true}}"#)
+            .execute(db.pool()).await.unwrap();
+        let resolver = TeamCapabilityResolver::new(Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone())));
+        let custom = resolver.resolve("system_default_user", "acp", Some("custom-team-agent")).await.unwrap();
+        assert_eq!(custom.origin, CapabilityOrigin::AcpHandshake);
+        assert!(custom.mcp.stdio);
+        let unknown = resolver.resolve("system_default_user", "acp", Some("absent-custom-agent")).await.unwrap();
+        assert_eq!(unknown.origin, CapabilityOrigin::Unknown);
     }
 
     #[test]
